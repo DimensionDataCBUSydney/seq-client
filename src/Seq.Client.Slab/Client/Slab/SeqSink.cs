@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.Tracing;
 using System.Linq;
 using System.Net;
@@ -19,8 +21,12 @@ namespace Seq.Client.Slab
     /// </summary>
     public class SeqSink : IObserver<EventEntry>, IDisposable
     {
+        readonly ConcurrentDictionary<int, string> _processNames = new ConcurrentDictionary<int, string>();
+
         readonly string _serverUrl;
         readonly string _apiKey;
+        readonly HttpClient _httpClient;
+
         readonly TimeSpan _onCompletedTimeout;
         readonly BufferedEventPublisher<EventEntry> _bufferedPublisher;
         readonly CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
@@ -40,7 +46,6 @@ namespace Seq.Client.Slab
         /// This means that if the timeout period elapses, some event entries will be dropped and not sent to the store. Normally, calling <see cref="IDisposable.Dispose" /> on
         /// the <see cref="System.Diagnostics.Tracing.EventListener" /> will block until all the entries are flushed or the interval elapses.
         /// If <see langword="null" /> is specified, then the call will block indefinitely until the flush operation finishes.</param>
-
         public SeqSink(
             string serverUrl,
             string apiKey, 
@@ -58,6 +63,8 @@ namespace Seq.Client.Slab
 
             _serverUrl = baseUri;
             _apiKey = apiKey;
+            _httpClient = new HttpClient { BaseAddress = new Uri(_serverUrl) };
+
             _onCompletedTimeout = onCompletedTimeout;
             _bufferedPublisher = BufferedEventPublisher<EventEntry>.CreateAndStart("Seq", PublishEventsAsync, bufferingInterval,
                 bufferingCount, maxBufferSize, _cancellationTokenSource.Token);
@@ -91,6 +98,10 @@ namespace Seq.Client.Slab
                 return;
 
             _bufferedPublisher.TryPost(value);
+
+            // Hacky cache-flush.
+            if (_processNames.Count > 500)
+                _processNames.Clear();
         }
 
         /// <summary>
@@ -114,6 +125,8 @@ namespace Seq.Client.Slab
                 _cancellationTokenSource.Cancel();
                 _cancellationTokenSource.Dispose();
                 _bufferedPublisher.Dispose();
+                _httpClient.CancelPendingRequests();
+                _httpClient.Dispose();
             }
         }
 
@@ -130,29 +143,27 @@ namespace Seq.Client.Slab
         {
             try
             {
-                var batch = CreateBatch(collection);
+                SeqBatch batch = CreateBatch(collection);
 
                 var content = new StringContent(JsonConvert.SerializeObject(batch), Encoding.UTF8, "application/json");
                 if (!string.IsNullOrWhiteSpace(_apiKey))
                     content.Headers.Add(ApiKeyHeaderName, _apiKey);
 
-                using (var httpClient = new HttpClient { BaseAddress = new Uri(_serverUrl) })
+                HttpResponseMessage response = await _httpClient.PostAsync(BulkUploadResource, content);
+                if (!response.IsSuccessStatusCode)
                 {
-                    var result = await httpClient.PostAsync(BulkUploadResource, content);
-                    if (!result.IsSuccessStatusCode)
+                    if (response.StatusCode == HttpStatusCode.BadRequest)
                     {
-                        if (result.StatusCode == HttpStatusCode.BadRequest)
-                        {
-                            var error = string.Format("Received failed result from Seq {0}: {1}", result.StatusCode, result.Content.ReadAsStringAsync().Result);
-                            SemanticLoggingEventSource.Log.CustomSinkUnhandledFault(error);
-                            return batch.Events.Count;
-                        }
+                        var error = string.Format("Received failed result from Seq {0}: {1}", response.StatusCode, response.Content.ReadAsStringAsync().Result);
+                        SemanticLoggingEventSource.Log.CustomSinkUnhandledFault(error);
 
-                        return 0;
+                        return batch.Events.Count;
                     }
 
-                    return batch.Events.Count;
+                    return 0;
                 }
+
+                return batch.Events.Count;
             }
             catch (OperationCanceledException)
             {
@@ -161,11 +172,12 @@ namespace Seq.Client.Slab
             catch (Exception ex)
             {
                 SemanticLoggingEventSource.Log.CustomSinkUnhandledFault("Failed to write events to Seq: " + ex);
-                throw;
+
+                return 0;
             }
         }
 
-        static SeqBatch CreateBatch(IEnumerable<EventEntry> eventEntries)
+        SeqBatch CreateBatch(IEnumerable<EventEntry> eventEntries)
         {
             return new SeqBatch
             {
@@ -175,36 +187,66 @@ namespace Seq.Client.Slab
 
         static readonly Dictionary<EventLevel, string> LevelMap = new Dictionary<EventLevel, string>
         {
-            { EventLevel.Critical, "Fatal" },
-            { EventLevel.Error, "Error" },
-            { EventLevel.Warning, "Warning" },
+            { EventLevel.Critical,      "Fatal" },
+            { EventLevel.Error,         "Error" },
+            { EventLevel.Warning,       "Warning" },
             { EventLevel.Informational, "Information" },
-            { EventLevel.Verbose, "Verbose" }
+            { EventLevel.Verbose,       "Verbose" }
         };
+
+        static readonly string MachineName = Environment.MachineName;
         
-        static SeqEventPayload CreatePayload(EventEntry eventEntry)
+        SeqEventPayload CreatePayload(EventEntry eventEntry)
         {
             var escapedMessage = (eventEntry.FormattedMessage ?? "<none>").Replace("{", "{{").Replace("}", "}}");
             string level;
             if (!LevelMap.TryGetValue(eventEntry.Schema.Level, out level))
                 level = "Information";
 
+            string processName = _processNames.GetOrAdd(
+                eventEntry.ProcessId,
+                processId =>
+                {
+                    Process process;
+                    try
+                    {
+                        process = Process.GetProcessById(eventEntry.ProcessId);
+                    }
+                    catch (ArgumentException)
+                    {
+                        return "Unknown (process has terminated)";
+                    }
+                    catch (Exception)
+                    {
+                        return "I have no idea (exception occurred while retrieving the process name)";
+                    }
+
+                    return process.ProcessName;
+                }
+            );
+
             var properties = new Dictionary<string,object>
             {
-                { "EtwEventId", eventEntry.EventId },
-                { "Keywords", (long)eventEntry.Schema.Keywords },
-                { "ProviderId", eventEntry.ProviderId },
-                { "ProviderName", eventEntry.Schema.ProviderName },
-                { "Opcode", (int)eventEntry.Schema.Opcode },
-                { "Task", (int)eventEntry.Schema.Task },
-                { "Version", eventEntry.Schema.Version },
-                { "ActivityId", eventEntry.ActivityId == Guid.Empty ? (Guid?) null : eventEntry.ActivityId },
+                { "MachineName",       MachineName },
+                { "ProcessId",         eventEntry.ProcessId },
+                { "ProcessName",       processName },
+                { "ProviderId",        eventEntry.ProviderId },
+                { "ProviderName",      eventEntry.Schema.ProviderName },
+                { "Task",              eventEntry.Schema.TaskName },
+                { "Opcode",            eventEntry.Schema.OpcodeName },
+                { "EtwEventId",        eventEntry.EventId },
+                { "KeywordFlags",      (long)eventEntry.Schema.Keywords },
+                { "Keywords",          eventEntry.Schema.KeywordsDescription },
+                { "Version",           eventEntry.Schema.Version },
+                { "ActivityId",        eventEntry.ActivityId == Guid.Empty ? (Guid?) null : eventEntry.ActivityId },
                 { "RelatedActivityId", eventEntry.RelatedActivityId  == Guid.Empty ? (Guid?) null : eventEntry.RelatedActivityId }
             };
 
-            for (var i = 0; i < eventEntry.Payload.Count; i++)
+            for (var payloadIndex = 0; payloadIndex < eventEntry.Payload.Count; payloadIndex++)
             {
-                properties[eventEntry.Schema.Payload[i]] = eventEntry.Payload[i];
+                string propertyName = eventEntry.Schema.Payload[payloadIndex];
+
+                properties[propertyName] = eventEntry.Payload[payloadIndex];
             }
 
             return new SeqEventPayload
